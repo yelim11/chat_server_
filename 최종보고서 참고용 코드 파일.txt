@@ -1,0 +1,1592 @@
+오예림의 코드
+
+//클라이언트
+
+
+#define NOMINMAX 
+#include <iostream>
+#include <string>
+#include <vector>
+#include <thread>
+#include <winsock2.h>
+#include <windows.h>
+#include <ws2tcpip.h>
+#include <conio.h>
+#include <limits>
+#include <ctime>
+#include <locale>
+#define NOMINMAX   
+
+#pragma comment(lib, "ws2_32.lib")
+using namespace std;
+
+SOCKET clientSock;
+bool connected = false;
+bool inChatRoom = false;
+bool loggedIn = false;
+bool recvThreadStarted = false;
+HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+thread recvThread;
+
+int navigateMenu(const vector<string>& options) {
+    int current = 0;
+    while (true) {
+        system("cls");
+        for (int i = 0; i < options.size(); ++i) {
+            if (i == current) SetConsoleTextAttribute(hConsole, 11);
+            cout << (i == current ? "→ " : "   ") << options[i] << '\n';
+            SetConsoleTextAttribute(hConsole, 7);
+        }
+        int key = _getch();
+        if (key == 224) {
+            key = _getch();
+            if (key == 72 && current > 0) --current;
+            else if (key == 80 && current < options.size() - 1) ++current;
+        }
+        else if (key == 13) {
+            return current;
+        }
+    }
+}
+
+void printWithColor(const string& msg, int color = 7) {
+    SetConsoleTextAttribute(hConsole, color);
+    cout << msg << flush;
+    SetConsoleTextAttribute(hConsole, 7);
+}
+
+void sendCommand(const string& command) {
+    send(clientSock, command.c_str(), static_cast<int>(command.length()), 0);
+    Sleep(100);
+}
+
+void clearInputLine() {
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    GetConsoleScreenBufferInfo(hConsole, &csbi);
+    COORD cursorPos = csbi.dwCursorPosition;
+    cursorPos.X = 0;
+    SetConsoleCursorPosition(hConsole, cursorPos);
+    for (int i = 0; i < csbi.dwSize.X; ++i) cout << ' ';
+    SetConsoleCursorPosition(hConsole, cursorPos);
+}
+
+void receiveMessages() {
+    char buffer[1024];
+    while (connected && inChatRoom) {
+        int bytes = recv(clientSock, buffer, sizeof(buffer) - 1, 0);
+        if (bytes > 0) {
+            buffer[bytes] = '\0';
+            string msg(buffer);
+            int color = 7;
+
+            // 색상 태그 파악
+            if (msg.rfind("/color:RED/", 0) == 0) color = 12;
+            else if (msg.rfind("/color:BLUE/", 0) == 0) color = 9;
+            else if (msg.rfind("/color:GREEN/", 0) == 0) color = 10;
+            else if (msg.rfind("/color:PINK/", 0) == 0) color = 13;
+            else if (msg.find("[귓속말") != string::npos) color = 13;
+
+            // 색상 태그 제거
+            size_t colorTagEnd = msg.find('/', 8); // 8은 "/color:" 이후
+            if (msg.rfind("/color:", 0) == 0 && colorTagEnd != string::npos) {
+                msg = msg.substr(colorTagEnd + 1); // 태그 이후 메시지만 추출
+            }
+
+            printWithColor(msg + "\n", color);
+        }
+        else if (bytes == 0 || WSAGetLastError() == WSAETIMEDOUT) {
+            continue;
+        }
+        else {
+            printWithColor("[서버 연결 종료됨]\n", 12);
+            connected = false;
+            break;
+        }
+    }
+}
+
+
+void friendMenu() {
+    while (true) {
+        system("cls");
+        vector<string> options = {
+            "친구 추가",
+            "친구 목록 보기",
+            "친구 요청 확인",
+            "친구 요청 수락",
+            "돌아가기"
+        };
+        int choice = navigateMenu(options);
+
+        if (choice == 0) {
+            string friendId;
+            cout << "추가할 친구 ID: ";
+            getline(cin, friendId);
+            sendCommand("/friend_add " + friendId);
+        }
+        else if (choice == 1) {
+            sendCommand("/friend_list");
+        }
+        else if (choice == 2) {
+            sendCommand("/friend_requests");
+        }
+        else if (choice == 3) {
+            string friendId;
+            cout << "수락할 친구 ID: ";
+            getline(cin, friendId);
+            sendCommand("/friend_accept " + friendId);
+
+            char buffer[1024] = { 0 };
+            int bytes = recv(clientSock, buffer, sizeof(buffer) - 1, 0);
+            if (bytes > 0) {
+                buffer[bytes] = '\0';
+                cout << buffer << "\n";
+
+                if (string(buffer).find("수락했습니다") != string::npos) {
+                    sendCommand("/friend_list");
+                    bytes = recv(clientSock, buffer, sizeof(buffer) - 1, 0);
+                    if (bytes > 0) {
+                        buffer[bytes] = '\0';
+                        cout << "\n[자동 친구 목록 갱신]\n" << buffer << "\n";
+                    }
+                }
+            }
+            else {
+                cout << "[서버 응답 없음]\n";
+            }
+
+            cout << "\n[Enter] 키를 눌러 계속...";
+            cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+            cin.get();
+
+            continue;  // 핵심: 아래 recv + get() 반복을 **건너뛴다**
+        }
+
+        else if (choice == 4) {
+            break; // 돌아가기
+        }
+
+        char buffer[1024] = { 0 };
+        int bytes = recv(clientSock, buffer, sizeof(buffer) - 1, 0);
+        if (bytes > 0) {
+            buffer[bytes] = '\0';
+            cout << buffer << "\n";
+        }
+        else {
+            cout << "[서버 응답 없음]\n";
+        }
+
+        cout << "\n[Enter] 키를 눌러 계속...";
+        cin.get();
+    }
+}
+
+
+
+
+void chatRoom() {
+    int timeout = 1000;
+    setsockopt(clientSock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+    sendCommand("/entertalk");
+    char buffer[1024] = { 0 };
+    int bytes = recv(clientSock, buffer, sizeof(buffer) - 1, 0);
+    if (bytes > 0 && string(buffer).find("/entertalk_ack") != string::npos) {
+        inChatRoom = true;
+        printWithColor("\n[채팅방 입장 완료: /나가기 입력 시 퇴장, /귓속말 [ID] [메시지]]\n", 11);
+        recvThreadStarted = true;
+        recvThread = thread(receiveMessages);
+    }
+    else {
+        printWithColor("[채팅방 입장 실패]\n", 12);
+        return;
+    }
+
+    srand((unsigned)time(NULL));
+    while (inChatRoom && connected) {
+        string msg;
+        getline(cin, msg);
+
+
+        //  입력 줄 지우기 (입력 완료 후 즉시)
+        CONSOLE_SCREEN_BUFFER_INFO csbi;
+        GetConsoleScreenBufferInfo(hConsole, &csbi);
+        COORD cursorPos = csbi.dwCursorPosition;
+        cursorPos.Y -= 1; // 위 줄로 이동 (방금 입력했던 줄)
+        cursorPos.X = 0;
+        SetConsoleCursorPosition(hConsole, cursorPos);
+        for (int i = 0; i < csbi.dwSize.X; ++i) cout << ' ';  // 줄 전체 지우기
+        SetConsoleCursorPosition(hConsole, cursorPos);        // 커서 되돌리기
+
+        if (msg == "/나가기" || msg == "/종료") {
+            cout << "\n[Enter] 키를 눌러 계속...";
+            inChatRoom = false;
+            break;
+        }
+        if (!msg.empty()) {
+            if (msg.find("/빨강") == 0) {
+                msg = "/color:RED/" + msg.substr(7);
+            }
+            else if (msg.find("/파랑") == 0) {
+                msg = "/color:BLUE/" + msg.substr(7);
+            }
+            else if (msg.find("/초록") == 0) {
+                msg = "/color:GREEN/" + msg.substr(8);
+            }
+            else if (msg.find("/핑크") == 0) {
+                msg = "/color:PINK/" + msg.substr(7);
+            }
+            send(clientSock, msg.c_str(), static_cast<int>(msg.length()), 0);
+        }
+    }
+
+
+    if (recvThreadStarted && recvThread.joinable()) {
+        recvThread.join();
+        recvThreadStarted = false;
+    }
+    int zero = 0;
+    setsockopt(clientSock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&zero, sizeof(zero));
+    cin.clear();
+    cin.ignore((numeric_limits<streamsize>::max)(), '\n');
+}
+
+string discoverServerIP();
+void mainMenu();
+void loginMenu();
+
+void mainMenu() {
+    while (connected && loggedIn) {
+
+        vector<string> options = {
+            "채팅방 입장",
+            "친구 메뉴",
+            "로그아웃",
+            "종료"
+        };
+        int choice = navigateMenu(options);
+        if (choice == 0) {
+            chatRoom();
+        }
+        else if (choice == 1) {
+            friendMenu();
+        }
+        else if (choice == 2) {
+            sendCommand("/logout");
+            loggedIn = false;
+            closesocket(clientSock);  // 기존 소켓 닫기
+            clientSock = socket(AF_INET, SOCK_STREAM, 0);  // 새 소켓 생성
+            sockaddr_in addr = {};
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(12345);
+            inet_pton(AF_INET, discoverServerIP().c_str(), &addr.sin_addr);
+
+            if (connect(clientSock, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+                cout << "[재연결 실패]\n";
+                WSACleanup();
+                exit(1);
+            }
+            cout << "[재연결 완료]\n";
+            return;  // loginMenu()로 돌아감
+        }
+
+        else if (choice == 3) {
+            cout << "[클라이언트 종료]\n";
+            closesocket(clientSock);
+            WSACleanup();
+            exit(0);
+        }
+    }
+}
+
+void loginMenu() {
+    while (connected && !loggedIn) {
+        vector<string> options = { "로그인", "회원가입", "종료" };
+        int choice = navigateMenu(options);
+
+        string id, pw;
+        if (choice == 2) {
+            cout << "종료합니다.\n";
+            closesocket(clientSock);
+            WSACleanup();
+            exit(0);
+        }
+
+        cout << "ID: "; getline(cin, id);
+        cout << "PW: "; getline(cin, pw);
+
+        string cmd = (choice == 0 ? "/login " : "/signup ") + id + " " + pw;
+        sendCommand(cmd);
+
+        char buffer[1024] = { 0 };
+        int bytes = recv(clientSock, buffer, sizeof(buffer) - 1, 0);
+        if (bytes > 0) {
+            buffer[bytes] = '\0';
+            cout << buffer << flush;
+            if (choice == 0 && string(buffer).find("성공") != string::npos) {
+                loggedIn = true;
+                mainMenu();
+            }
+        }
+        else {
+            cout << "[에러] 서버 응답 없음\n";
+        }
+        cout << "\n[Enter] 키를 눌러 계속...";
+        cin.get();
+    }
+}
+
+string discoverServerIP() {
+    SOCKET udpSock = socket(AF_INET, SOCK_DGRAM, 0);
+    BOOL broadcast = TRUE;
+    setsockopt(udpSock, SOL_SOCKET, SO_BROADCAST, (char*)&broadcast, sizeof(broadcast));
+    int timeout = 3000;
+    setsockopt(udpSock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
+
+    sockaddr_in sendAddr{};
+    sendAddr.sin_family = AF_INET;
+    sendAddr.sin_port = htons(8888);
+    sendAddr.sin_addr.s_addr = INADDR_BROADCAST;
+
+    string msg = "DISCOVER_SERVER";
+    sendto(udpSock, msg.c_str(), (int)msg.length(), 0, (sockaddr*)&sendAddr, sizeof(sendAddr));
+
+    char buffer[1024];
+    sockaddr_in fromAddr{};
+    int fromLen = sizeof(fromAddr);
+    int bytes = recvfrom(udpSock, buffer, sizeof(buffer) - 1, 0, (sockaddr*)&fromAddr, &fromLen);
+
+    closesocket(udpSock);
+
+    if (bytes > 0) {
+        buffer[bytes] = '\0';
+        if (string(buffer) == "SERVER_HERE") {
+            char ipStr[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &fromAddr.sin_addr, ipStr, sizeof(ipStr));
+            return string(ipStr);
+        }
+    }
+    return "";
+}
+
+void showTitle() {
+    cout << R"(
+┌────────────────────────────────────────────┐
+│                                            │
+│   ****     *   *   *****   *****           │
+│  *         *   *   *   *     *             │
+│  *         *****   *****     *             │
+│  *         *   *   *   *     *             │
+│   ****     *   *   *   *     *             │
+│                                            │
+│                 C  H  A  T                 │
+└────────────────────────────────────────────┘
+)";
+    Sleep(2000); // 2000 밀리초 = 2초 대기
+}
+
+int main() {
+    SetConsoleOutputCP(CP_UTF8);   // 여전히 유효
+    setlocale(LC_ALL, "");         // 지역화 설정
+    wcout.imbue(locale("korean")); // 한글 지역 설정
+    WSADATA wsa;
+    int result = WSAStartup(MAKEWORD(2, 2), &wsa);
+    if (result != 0) {
+        cerr << "WSAStartup 실패: " << result << endl;
+        return 1;
+    }
+    string ip = discoverServerIP();
+    if (ip.empty()) {
+        cout << "서버를 찾을 수 없습니다.\n";
+        return 1;
+    }
+    cout << "서버 발견됨: 입장중..." << endl;
+    showTitle();
+    int port = 12345;
+    clientSock = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    inet_pton(AF_INET, ip.c_str(), &addr.sin_addr);
+    if (connect(clientSock, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+        cout << "서버 연결 실패\n";
+        return 1;
+    }
+    cout << "[클라이언트] 서버 연결됨\n";
+    connected = true;
+    loginMenu();
+    return 0;
+}
+
+//서버
+
+#define _WINSOCK_DEPRECATED_NO_WARNINGS
+#include <iostream>
+#include <string>
+#include <map>
+#include <set>
+#include <vector>
+#include <thread>
+#include <fstream>
+#include <sstream>
+#include <mutex>
+#include <chrono>
+#include <ctime>
+#include <locale>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
+
+using namespace std;
+
+struct User {
+    string id;
+    string password;
+    bool isOnline = false;
+};
+
+class ChatServer {
+private:
+    SOCKET serverSock = INVALID_SOCKET;
+    map<SOCKET, string> onlineUsers;
+    set<SOCKET> chatParticipants;
+    mutex onlineMutex, chatMutex;
+
+    map<string, User> users;
+    map<string, int> updownTarget;
+    map<string, pair<int, chrono::steady_clock::time_point>> speedGameData;
+
+    static void udpDiscoveryResponder() {
+        SOCKET udpSock = socket(AF_INET, SOCK_DGRAM, 0);
+        sockaddr_in serverAddr{};
+        serverAddr.sin_family = AF_INET;
+        serverAddr.sin_port = htons(8888);
+        serverAddr.sin_addr.s_addr = INADDR_ANY;
+        bind(udpSock, (sockaddr*)&serverAddr, sizeof(serverAddr));
+
+        char buffer[1024];
+        sockaddr_in clientAddr{};
+        int clientLen = sizeof(clientAddr);
+
+        while (true) {
+            int bytes = recvfrom(udpSock, buffer, sizeof(buffer) - 1, 0, (sockaddr*)&clientAddr, &clientLen);
+            if (bytes > 0) {
+                buffer[bytes] = '\0';
+                if (string(buffer) == "DISCOVER_SERVER") {
+                    string reply = "SERVER_HERE";
+                    sendto(udpSock, reply.c_str(), (int)reply.length(), 0, (sockaddr*)&clientAddr, clientLen);
+                }
+            }
+        }
+    }
+
+    void sendMessage(SOCKET sock, const string& msg) {
+        send(sock, msg.c_str(), static_cast<int>(msg.length()), 0);
+    }
+
+    void saveFriendRequest(const string& from, const string& to) {
+        ofstream fout("friend_requests.txt", ios::app);
+        fout << from << " " << to << "\n";
+    }
+
+    bool hasPendingRequest(const string& from, const string& to) {
+        ifstream fin("friend_requests.txt");
+        string a, b;
+        while (fin >> a >> b) {
+            if (a == from && b == to) return true;
+        }
+        return false;
+    }
+
+    void removeFriendRequest(const string& from, const string& to) {
+        ifstream fin("friend_requests.txt");
+        vector<pair<string, string>> requests;
+        string a, b;
+        while (fin >> a >> b) {
+            if (!(a == from && b == to)) {
+                requests.emplace_back(a, b);
+            }
+        }
+        fin.close();
+        ofstream fout("friend_requests.txt", ios::trunc);
+        for (auto& p : requests) fout << p.first << " " << p.second << "\n";
+    }
+
+    void addFriendRelation(const string& user1, const string& user2) {
+        ofstream fout("friends.txt", ios::app);
+        fout << user1 << " " << user2 << "\n";
+        fout << user2 << " " << user1 << "\n";
+    }
+
+    vector<string> getFriendList(const string& user) {
+        vector<string> friends;
+        ifstream fin("friends.txt");
+        string a, b;
+        while (fin >> a >> b) {
+            if (a == user) friends.push_back(b);
+        }
+        return friends;
+    }
+
+    vector<string> getFriendRequests(const string& user) {
+        vector<string> requests;
+        ifstream fin("friend_requests.txt");
+        string from, to;
+        while (fin >> from >> to) {
+            if (to == user) requests.push_back(from);
+        }
+        return requests;
+    }
+
+    void loadUsers() {
+        ifstream fin("users.txt");
+        string id, pw;
+        while (fin >> id >> pw) {
+            users[id] = { id, pw, false };
+        }
+    }
+
+    void handleClient(SOCKET sock) {
+        char buffer[1024];
+        string currentUser;
+
+        while (true) {
+            int bytes = recv(sock, buffer, sizeof(buffer) - 1, 0);
+            if (bytes <= 0) break;
+            buffer[bytes] = '\0';
+            string cmdline(buffer);
+            istringstream iss(cmdline);
+            string cmd; iss >> cmd;
+
+            if (cmd == "/signup") {
+                string id, pw; iss >> id >> pw;
+                if (!users.count(id)) {
+                    users[id] = { id, pw, false };
+                    ofstream fout("users.txt", ios::app);
+                    fout << id << " " << pw << "\n";
+                    sendMessage(sock, "[SYSTEM] 회원가입 성공\n");
+                }
+                else sendMessage(sock, "[SYSTEM] 회원가입 실패 - 아이디 중복\n");
+            }
+            else if (cmd == "/login") {
+                string id, pw; iss >> id >> pw;
+                if (users.count(id) && users[id].password == pw) {
+                    users[id].isOnline = true;
+                    {
+                        lock_guard<mutex> lock(onlineMutex);
+                        onlineUsers[sock] = id;
+                    }
+                    currentUser = id;
+                    sendMessage(sock, "[SYSTEM] 로그인 성공\n");
+                }
+                else sendMessage(sock, "[SYSTEM] 로그인 실패\n");
+            }
+            else if (cmd == "/logout") {
+                if (!currentUser.empty()) {
+                    users[currentUser].isOnline = false;
+                    {
+                        lock_guard<mutex> lock(onlineMutex);
+                        onlineUsers.erase(sock);
+                    }
+                    currentUser.clear();
+                    sendMessage(sock, "[SYSTEM] 로그아웃 완료\n");
+                }
+            }
+            else if (cmd == "/entertalk") {
+                {
+                    lock_guard<mutex> lock(chatMutex);
+                    chatParticipants.insert(sock);
+                }
+                sendMessage(sock, "/entertalk_ack\n");
+                string joinMsg = "[SYSTEM] " + currentUser + "님이 입장하셨습니다.\n";
+                {
+                    lock_guard<mutex> lock(chatMutex);
+                    for (auto& s : chatParticipants) {
+                        if (s != sock) sendMessage(s, joinMsg);
+                    }
+                }
+            }
+            else if (cmd == "/귓속말") {
+                string toId; iss >> toId;
+                string msg; getline(iss, msg);
+                if (!msg.empty() && msg[0] == ' ') msg.erase(0, 1);
+                SOCKET targetSock = -1;
+                {
+                    lock_guard<mutex> lock(onlineMutex);
+                    for (auto& pair : onlineUsers) {
+                        SOCKET s = pair.first;
+                        string id = pair.second;
+                        if (id == toId) {
+                            targetSock = s;
+                            break;
+                        }
+                    }
+                }
+                if (targetSock != -1) {
+                    sendMessage(targetSock, "[귓속말] " + currentUser + ": " + msg + "\n");
+                    sendMessage(sock, "[SYSTEM] 귓속말 전송 완료\n");
+                }
+                else sendMessage(sock, "[SYSTEM] 대상이 오프라인입니다.\n");
+            }
+            else if (cmd == "/도움말") {
+                string help = "[도움말]\n";
+                help += "------------------------------\n";
+                help += "[채팅 관련]\n";
+                help += "/red 메시지        - 빨간 글씨로 출력\n";
+                help += "/blue 메시지       - 파란 글씨로 출력\n";
+                help += "/green 메시지      - 초록 글씨로 출력\n";
+                // help += "/black 메시지      - 검정 글씨로 출력\n";
+                help += "/도움말            - 이 도움말 출력\n";
+
+                help += "\n[게임 명령어]\n";
+                help += "#랜덤숫자          - 랜덤 숫자 출력\n";
+                help += "#업다운            - 업다운 게임 시작\n";
+                help += "#입력숫자 N        - 숫자 입력 (업다운)\n";
+                help += "#스피드            - 숫자 입력 스피드 게임 시작\n";
+                help += "#스피드입력 N      - 숫자 입력 (스피드)\n";
+
+                help += "\n[귓속말]\n";
+                help += "/귓속말 ID 내용    - 친구에게 귓속말 보내기\n";
+
+                help += "\n[친구 기능]\n";
+                help += "/friend_add ID     - 친구 요청 보내기\n";
+                help += "/friend_accept ID  - 친구 요청 수락\n";
+                help += "/friend_list       - 친구 목록 보기\n";
+                help += "/friend_requests   - 받은 친구 요청 보기\n";
+                help += "------------------------------\n";
+                sendMessage(sock, help);
+            }
+
+            else if (cmd == "#업다운") {
+                updownTarget[currentUser] = rand() % 100 + 1;
+                sendMessage(sock, "[SYSTEM] 업다운 게임 시작! 1~100 사이의 숫자를 맞히세요.\n");
+            }
+            else if (cmd == "#입력숫자") {
+                int guess; iss >> guess;
+                if (!updownTarget.count(currentUser)) {
+                    sendMessage(sock, "[SYSTEM] 먼저 #업다운 명령으로 게임을 시작하세요.\n");
+                }
+                else {
+                    int target = updownTarget[currentUser];
+                    if (guess < target) sendMessage(sock, "[SYSTEM] Up!\n");
+                    else if (guess > target) sendMessage(sock, "[SYSTEM] Down!\n");
+                    else {
+                        sendMessage(sock, "[SYSTEM] [" + currentUser + "] 우승!! 정답입니다! 게임 종료\n");
+                        updownTarget.erase(currentUser);
+                    }
+                }
+            }
+            else if (cmd == "#스피드") {
+                int target = rand() % 900 + 100;
+                speedGameData[currentUser] = { target, chrono::steady_clock::now() };
+                sendMessage(sock, "[SYSTEM] 스피드 게임 시작! 숫자를 입력하세요: " + to_string(target) + "\n");
+            }
+            else if (cmd == "#스피드입력") {
+                int input; iss >> input;
+                if (!speedGameData.count(currentUser)) {
+                    sendMessage(sock, "[SYSTEM] 먼저 #스피드 명령으로 게임을 시작하세요.\n");
+                }
+                else {
+                    int target = speedGameData[currentUser].first;
+                    chrono::steady_clock::time_point start = speedGameData[currentUser].second;
+                    auto now = chrono::steady_clock::now();
+                    auto duration = chrono::duration_cast<chrono::milliseconds>(now - start).count();
+
+                    if (input == target) {
+                        sendMessage(sock, "[SYSTEM] [" + currentUser + "] 우승!! 정답입니다! 시간: " + to_string(static_cast<double>(duration) / 1000.0) + "초\n");
+                    }
+                    else {
+                        sendMessage(sock, "[SYSTEM] 오답입니다. 정답: " + to_string(target) + "\n");
+                    }
+                    speedGameData.erase(currentUser);
+                }
+            }
+
+            else {
+                string content;
+                getline(iss, content);
+                if (!content.empty() && content.front() == ' ') content.erase(content.begin());
+                string color = "";
+                if (cmd == "/red") { color = "/color:RED/"; cmd = ""; }
+                else if (cmd == "/blue") { color = "/color:BLUE/"; cmd = ""; }
+                else if (cmd == "/green") { color = "/color:GREEN/"; cmd = ""; }
+                string formatted = color + "[" + currentUser + "] " + cmd + " " + content + "\n";
+                {
+                    lock_guard<mutex> lock(chatMutex);
+                    for (auto& s : chatParticipants) sendMessage(s, formatted);
+                }
+            }
+        }
+
+        if (!currentUser.empty()) {
+            users[currentUser].isOnline = false;
+            {
+                lock_guard<mutex> lock(chatMutex);
+                chatParticipants.erase(sock);
+                string msg = "[SYSTEM] " + currentUser + "님이 퇴장하셨습니다.\n";
+                for (auto& s : chatParticipants) sendMessage(s, msg);
+            }
+            {
+                lock_guard<mutex> lock(onlineMutex);
+                onlineUsers.erase(sock);
+            }
+        }
+        closesocket(sock);
+    }
+
+public:
+    void run(int port = 12345) {
+        WSAData wsa;
+        if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+            cerr << "WSAStartup 실패\n";
+            return;
+        }
+
+        loadUsers();
+        thread(udpDiscoveryResponder).detach();
+
+        serverSock = socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        addr.sin_addr.s_addr = INADDR_ANY;
+
+        if (bind(serverSock, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+            cerr << "바인딩 실패\n";
+            return;
+        }
+        if (listen(serverSock, SOMAXCONN) == SOCKET_ERROR) {
+            cerr << "리스닝 실패\n";
+            return;
+        }
+
+        cout << "[서버 실행 중] 포트 " << port << endl;
+        while (true) {
+            SOCKET client = accept(serverSock, nullptr, nullptr);
+            if (client != INVALID_SOCKET) {
+                thread(&ChatServer::handleClient, this, client).detach();
+            }
+        }
+    }
+};
+
+int main() {
+    SetConsoleOutputCP(CP_UTF8);
+    setlocale(LC_ALL, "");
+    srand((unsigned)time(NULL));
+
+    ChatServer server;
+    server.run();
+    return 0;
+}
+
+
+
+최인경의 코드
+
+// client.cpp
+
+#include <iostream>
+#include <string>
+#include <thread>
+#include <winsock2.h>
+#include <windows.h>
+#include <ws2tcpip.h>
+
+#pragma comment(lib, "ws2_32.lib")
+using namespace std;
+
+SOCKET clientSock;
+bool connected = false;
+bool inChatRoom = false;
+
+HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+
+void printWithColor(const string& msg, int color = 7)
+{
+    SetConsoleTextAttribute(hConsole, color);
+    cout << msg << flush;
+    SetConsoleTextAttribute(hConsole, 7);
+}
+
+void receiveMessages()
+{
+    char buffer[1024];
+    while (connected)
+    {
+        int bytes = recv(clientSock, buffer, sizeof(buffer) - 1, 0);
+        if (bytes > 0)
+        {
+            buffer[bytes] = '\0';
+            string msg(buffer);
+
+            if (!inChatRoom) continue;
+
+            if (msg.find("[귓속말") != string::npos)
+            {
+                printWithColor(msg, 13);
+            }
+            else
+            {
+                cout << msg << flush;
+            }
+        }
+
+        else
+        {
+            connected = false;
+            printWithColor(" [ 서버 연결 종료 됨 ]\n", 12);
+            break;
+        }
+
+    }
+}
+
+void sendCommand(const string& command)
+{
+    send(clientSock, command.c_str(), static_cast<int>(command.length()), 0);
+    Sleep(100);
+}
+
+void receiveResponse() 
+{
+    char buffer[1024] = { 0 };
+    int bytes = recv(clientSock, buffer, sizeof(buffer) - 1, 0);
+    if (bytes > 0)
+    {
+        buffer[bytes] = '\0';
+        cout << buffer << flush;
+    }
+    else
+    {
+        cout << "에러! 응답 수신 실패\n";
+    }
+}
+
+void handleFriendRequests()
+{
+    sendCommand("/viewrequests");
+
+    char buffer[1024] = { 0 };
+    int bytes = recv(clientSock, buffer, sizeof(buffer) - 1, 0);
+    if (bytes > 0) {
+        buffer[bytes] = '\0';
+        cout << buffer << flush;
+
+        if (string(buffer).find("요청 없음") == string::npos) {
+            cout << "수락할 ID 입력 (취소하려면 엔터): ";
+            string acceptId;
+            getline(cin, acceptId);
+            if (!acceptId.empty()) {
+                sendCommand("/acceptfriend " + acceptId);
+                receiveResponse();
+            }
+        }
+    }
+    else {
+        cout << "[에러] 친구 요청 수신 실패\n";
+    }
+}
+
+void chatRoom()
+{
+    sendCommand("/entertalk");
+
+    char buffer[1024] = { 0 };
+    int bytes = recv(clientSock, buffer, sizeof(buffer) - 1, 0);
+    if (bytes > 0)
+    {
+        buffer[bytes] = '\0';
+        if (string(buffer).find("/entertalk_ack") != string::npos)
+        {
+            inChatRoom = true;
+            printWithColor("\n[채팅방 입장 완료 '/나가기' 입력 시 퇴장, '/귓속말 [ID] [메시지]']\n", 11);
+        }
+        else
+        {
+            printWithColor("[채팅방 입장 실패]\n", 12);
+            return;
+        }
+    }
+    else
+    {
+        printWithColor("[에러] 채팅방 응답 없음\n", 12);
+        return;
+    }
+
+    thread recvThread(receiveMessages);
+    recvThread.detach();
+
+    while (inChatRoom && connected)
+    {
+        string msg;
+        getline(cin, msg);
+
+        if (msg == "/종료" || msg == "/나가기")
+        {
+            inChatRoom = false;
+            break;
+        }
+        else if (msg == "#업다운")
+        {
+            sendCommand("#업다운");
+
+            while (true)
+            {
+                char buffer[1024] = { 0 };
+                int bytes = recv(clientSock, buffer, sizeof(buffer) - 1, 0);
+                if (bytes <= 0) break;
+                buffer[bytes] = '\0';
+                cout << buffer;
+
+                if (string(buffer).find("정답입니다") != string::npos) break;
+
+                cout << "[숫자 입력]: ";
+                string guess;
+                getline(cin, guess);
+                sendCommand(guess);
+            }
+        }
+        else
+        {
+            send(clientSock, msg.c_str(), static_cast<int>(msg.length()), 0);
+        }
+    }
+}
+
+void mainMenu()
+{
+    while (connected)
+    {
+        cout << "\n===== 메인 메뉴 =====\n1. 친구 메뉴\n2. 채팅방 입장\n3. 종료\n선택: ";
+        int choice;
+        cin >> choice;
+        cin.ignore();
+
+        if (choice == 1)
+        {
+            while (true)
+            {
+                cout << "\n===== 친구 메뉴 =====\n1. 친구 목록 보기\n2. 친구 요청 보내기\n3. 친구 요청 확인/수락\n4. 메인메뉴로 돌아가기\n선택: ";
+                int sub;
+                cin >> sub;
+                cin.ignore();
+
+                if (sub == 1)
+                {
+                    sendCommand("/getfriends");
+                    receiveResponse();
+                }
+                else if (sub == 2)
+                {
+                    string target;
+                    cout << "요청할 친구 ID: ";
+                    getline(cin, target);
+                    sendCommand("/friendrequest " + target);
+                    receiveResponse();
+                }
+                else if (sub == 3)
+                {
+                    handleFriendRequests();
+                }
+                else if (sub == 4)
+                {
+                    break;
+                }
+                else
+                {
+                    cout << "잘못된 선택입니다.\n";
+                }
+            }
+        }
+        else if (choice == 2)
+        {
+            chatRoom();
+        }
+        else if (choice == 3)
+        {
+            cout << "종료합니다.\n";
+            closesocket(clientSock);
+            WSACleanup();
+            exit(0);
+        }
+        else
+        {
+            cout << "잘못된 선택입니다.\n";
+        }
+    }
+}
+
+void loginMenu()
+{
+    while (connected)
+    {
+        cout << "\n===== 시작 메뉴 =====\n1. 로그인\n2. 회원가입\n선택: ";
+        int choice;
+        cin >> choice;
+        cin.ignore();
+
+        string id, pw;
+        cout << "ID: "; getline(cin, id);
+        cout << "PW: "; getline(cin, pw);
+
+        string cmd = (choice == 1 ? "/login " : "/signup ") + id + " " + pw;
+        sendCommand(cmd);
+
+        char buffer[1024] = { 0 };
+        int bytes = recv(clientSock, buffer, sizeof(buffer) - 1, 0);
+        if (bytes > 0)
+        {
+            buffer[bytes] = '\0';
+            cout << buffer << flush;
+
+            if (choice == 1 && string(buffer).find("성공") != string::npos)
+            {
+                mainMenu();
+                return;
+            }
+        }
+        else
+        {
+            cout << "[에러] 서버 응답 없음\n";
+        }
+    }
+}
+
+int main()
+{
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+
+    string ip;
+    int port;
+    cout << "서버 IP: "; cin >> ip;
+    cout << "포트: "; cin >> port;
+
+    clientSock = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    inet_pton(AF_INET, ip.c_str(), &addr.sin_addr);
+
+    if (connect(clientSock, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR)
+    {
+        cout << "서버 연결 실패\n";
+        return 1;
+    }
+
+    cout << "[클라이언트] 서버 연결됨\n";
+    connected = true;
+
+    loginMenu();
+    return 0;
+}
+
+//server.cpp
+
+#include <iostream>
+#include <string>
+#include <map>
+#include <vector>
+#include <set>
+#include <thread>
+#include <fstream>
+#include <sstream>
+#include <algorithm>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <mutex>
+
+#pragma comment(lib, "ws2_32.lib")
+
+using namespace std;
+
+struct User {
+    string id;
+    string password;
+    bool isOnline = false;
+};
+
+class UserManager {
+private:
+    map<string, User> users;
+    mutex mtx;
+
+public:
+    void load() {
+        ifstream fin("users.txt");
+        string id, pw;
+        while (fin >> id >> pw) {
+            users[id] = { id, pw, false };
+        }
+    }
+
+    void save(const string& id, const string& pw) {
+        ofstream fout("users.txt", ios::app);
+        fout << id << " " << pw << "\n";
+    }
+
+    bool signup(const string& id, const string& pw) {
+        lock_guard<mutex> lock(mtx);
+        if (users.count(id)) return false;
+        users[id] = { id, pw, false };
+        save(id, pw);
+        return true;
+    }
+
+    bool login(const string& id, const string& pw) {
+        lock_guard<mutex> lock(mtx);
+        return users.count(id) && users[id].password == pw;
+    }
+
+    void setOnline(const string& id, bool status) {
+        lock_guard<mutex> lock(mtx);
+        users[id].isOnline = status;
+    }
+
+    bool isOnline(const string& id) {
+        lock_guard<mutex> lock(mtx);
+        return users.count(id) && users[id].isOnline;
+    }
+
+    bool exists(const string& id) {
+        lock_guard<mutex> lock(mtx);
+        return users.count(id);
+    }
+};
+
+class FriendManager {
+private:
+    map<string, vector<string>> friends;
+    map<string, vector<string>> pending;
+    mutex mtx;
+
+public:
+    void load() {
+        ifstream ff("friends.txt");
+        string line;
+        while (getline(ff, line)) {
+            istringstream iss(line);
+            string id, f;
+            iss >> id;
+            while (iss >> f) friends[id].push_back(f);
+        }
+        ff.close();
+
+        ifstream pr("requests.txt");
+        while (getline(pr, line)) {
+            istringstream iss(line);
+            string id, from;
+            iss >> id;
+            while (iss >> from) pending[id].push_back(from);
+        }
+        pr.close();
+    }
+
+    void save() {
+        ofstream ff("friends.txt");
+        for (auto& p : friends) {
+            ff << p.first;
+            for (auto& f : p.second) ff << " " << f;
+            ff << "\n";
+        }
+
+        ofstream pr("requests.txt");
+        for (auto& p : pending) {
+            pr << p.first;
+            for (auto& r : p.second) pr << " " << r;
+            pr << "\n";
+        }
+    }
+
+    bool isFriend(const string& a, const string& b) {
+        return find(friends[a].begin(), friends[a].end(), b) != friends[a].end();
+    }
+
+    void request(const string& from, const string& to) {
+        pending[to].push_back(from);
+        save();
+    }
+
+    bool hasRequest(const string& to, const string& from) {
+        return find(pending[to].begin(), pending[to].end(), from) != pending[to].end();
+    }
+
+    void accept(const string& user, const string& from) {
+        auto& p = pending[user];
+        p.erase(remove(p.begin(), p.end(), from), p.end());
+        friends[user].push_back(from);
+        friends[from].push_back(user);
+        save();
+    }
+
+    vector<string> getFriends(const string& id) {
+        return friends[id];
+    }
+
+    vector<string> getRequests(const string& id) {
+        return pending[id];
+    }
+};
+
+class ChatServer
+{
+private:
+    SOCKET serverSock = INVALID_SOCKET;
+    map<SOCKET, string> onlineUsers;
+    set<SOCKET> chatParticipants;
+    mutex onlineMutex, chatMutex;
+
+    UserManager userManager;
+    FriendManager friendManager;
+
+    void sendMessage(SOCKET sock, const string& msg)
+    {
+        send(sock, msg.c_str(), static_cast<int>(msg.length()), 0);
+    }
+
+    void handleClient(SOCKET sock)
+    {
+        cout << "[접속] 클라이언트가 연결됨." << endl;
+
+        char buffer[1024];
+        string currentUser;
+
+        while (true)
+        {
+            int bytes = recv(sock, buffer, sizeof(buffer) - 1, 0);
+            if (bytes <= 0)break;
+
+            buffer[bytes] = '\0';
+            string cmdline(buffer);
+            istringstream iss(cmdline);
+            string cmd;
+            iss >> cmd;
+
+            if (cmd == "/signup")
+            {
+                string id, pw;
+                iss >> id >> pw;
+                bool ok = userManager.signup(id, pw);
+                sendMessage(sock, ok ? "회원가입 성공!\n" : "회원가입 실패!\n");
+            }
+
+            else if (cmd == "/login")
+            {
+                string id, pw;
+                iss >> id >> pw;
+                if (userManager.login(id, pw))
+                {
+                    userManager.setOnline(id, true);
+                    {
+                        lock_guard<mutex> lock(onlineMutex);
+                        onlineUsers[sock] = id;
+                    }
+                    currentUser = id;
+                    sendMessage(sock, "로그인 성공!\n");
+                }
+
+                else
+                {
+                    sendMessage(sock, "로그인 실패!\n");
+                }
+            }
+
+            else if (cmd == "\#업다운")
+            {
+                int answer = rand() % 100 + 1;
+                sendMessage(sock, "업다운 게임 시작! = 1 ~ 100 사이 숫자를 맞혀보세요!");
+
+                while (true)
+                {
+                    char inputBuf[1024] = { 0 };
+                    int inputBytes = recv(sock, inputBuf, sizeof(inputBuf) - 1, 0);
+                    if (inputBytes <= 0)break;
+
+                    inputBuf[inputBytes] = '\0';
+                    string inputStr(inputBuf);
+                    int guess = atoi(inputStr.c_str());
+                    if (guess == 0 && inputStr[0] != '0')
+                    {
+                        sendMessage(sock, "숫자를 입력해주세요!\n");
+                        continue;
+                    }
+
+                    if (guess < answer) sendMessage(sock, "업!\n");
+                    else if (guess > answer) sendMessage(sock, "다운!\n");
+                    else
+                    {
+                        sendMessage(sock, "정답입니다!\n");
+                        break;
+                    }
+                }
+            }
+
+            if (!currentUser.empty()) userManager.setOnline(currentUser, false);
+            {
+                lock_guard<mutex> lock(onlineMutex);
+                onlineUsers.erase(sock);
+            }
+            {
+                lock_guard<mutex> lock(chatMutex);
+                chatParticipants.erase(sock);
+            }
+            closesocket(sock);
+            cout << " 연 결 종 료 ! " << currentUser << endl;
+        }
+    }
+
+public:
+
+    void run(int port = 12345)
+    {
+        if (WSAStartup(MAKEWORD(2, 2), new WSADATA) != 0)
+        {
+            cerr << "에러! WSAStartup 실패! \n";
+            return;
+        }
+
+        userManager.load();
+        friendManager.load();
+
+        serverSock = socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in addr = {};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        addr.sin_addr.s_addr = INADDR_ANY;
+
+        if (bind(serverSock, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR)
+        {
+            cerr << "에러 바인딩 실패! " << endl;
+            return;
+        }
+
+        if (listen(serverSock, SOMAXCONN) == SOCKET_ERROR)
+        {
+            cerr << "에러! 리스닝 실패! " << endl ;
+            return;
+        }
+
+        cout << "서버 실행 중 ... " << endl;
+        
+        while (true)
+        {
+            SOCKET clientSock = accept(serverSock, nullptr, nullptr);
+            if (clientSock != INVALID_SOCKET)
+            {
+                thread(&ChatServer::handleClient, this, clientSock).detach();
+            }
+        }
+    }
+};
+
+int main()
+{
+    ChatServer server;
+    server.run(12345);
+
+    return 0;
+}
+
+
+김형민의 코드
+
+#include <iostream>
+#include <winsock2.h>
+#include <thread>
+#include <vector>
+#include <fstream>
+#include <string>
+#include <algorithm>
+#include <sstream>
+#pragma comment(lib, "ws2_32.lib")
+
+#define MAX_CLIENTS 10
+
+std::vector<SOCKET> clients;
+
+// 채팅 메시지 브로드캐스트 및 로그 저장 함수
+void broadcastMessage(const std::string& message) {
+    // 채팅 로그 파일에 메시지 저장
+    std::ofstream logFile("chatlog.txt", std::ios::app);
+    logFile << message << std::endl;  // 메시지 로그에 추가
+    logFile.close();
+
+    // 모든 클라이언트에게 메시지 전달
+    for (SOCKET client : clients) {
+        send(client, message.c_str(), message.length(), 0);
+    }
+}
+
+// 클라이언트 핸들링 함수
+void clientHandler(SOCKET clientSocket) {
+    char buffer[1024];
+    int bytesReceived;
+
+    // 새로 접속한 클라이언트에게 기존 채팅 내용 전송
+    std::ifstream logFile("chatlog.txt");
+    std::string line;
+    while (std::getline(logFile, line)) {
+        send(clientSocket, line.c_str(), line.length(), 0);
+        send(clientSocket, "\n", 1, 0);  // 각 메시지 후 개행 추가
+    }
+    logFile.close();
+
+    // 클라이언트로부터 받은 메시지 처리
+    while ((bytesReceived = recv(clientSocket, buffer, sizeof(buffer), 0)) > 0) {
+        buffer[bytesReceived] = '\0';  // 널 종료 문자 추가
+        std::string message = "[클라이언트] " + std::string(buffer);  // 메시지 포맷
+        std::cout << message << std::endl;
+
+        // 메시지를 브로드캐스트하고 chatlog.txt에 저장
+        broadcastMessage(message);
+    }
+
+    // 클라이언트 연결 종료 처리
+    closesocket(clientSocket);
+    clients.erase(std::remove(clients.begin(), clients.end(), clientSocket), clients.end());
+}
+
+// 서버 메인 함수
+int main() {
+    WSADATA wsaData;
+    SOCKET serverSocket, clientSocket;
+    SOCKADDR_IN serverAddr, clientAddr;
+    int clientSize = sizeof(clientAddr);
+
+    // Winsock 초기화
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        std::cerr << "Winsock 초기화 실패: " << WSAGetLastError() << std::endl;
+        return 1;
+    }
+
+    // 서버 소켓 생성
+    serverSocket = socket(AF_INET, SOCK_STREAM, 0);
+    if (serverSocket == INVALID_SOCKET) {
+        std::cerr << "서버 소켓 생성 실패: " << WSAGetLastError() << std::endl;
+        WSACleanup();
+        return 1;
+    }
+
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(12345);  // 서버 포트 설정
+    serverAddr.sin_addr.s_addr = INADDR_ANY;  // 모든 네트워크 인터페이스에서 수신
+
+    // 서버 소켓 바인딩
+    if (bind(serverSocket, (SOCKADDR*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
+        std::cerr << "서버 소켓 바인딩 실패: " << WSAGetLastError() << std::endl;
+        closesocket(serverSocket);
+        WSACleanup();
+        return 1;
+    }
+
+    // 클라이언트 연결 대기
+    if (listen(serverSocket, MAX_CLIENTS) == SOCKET_ERROR) {
+        std::cerr << "서버 소켓 리스닝 실패: " << WSAGetLastError() << std::endl;
+        closesocket(serverSocket);
+        WSACleanup();
+        return 1;
+    }
+
+    std::cout << "서버가 시작되었습니다. 클라이언트 접속 대기 중..." << std::endl;
+
+    // 클라이언트 접속 처리
+    while (true) {
+        clientSocket = accept(serverSocket, (SOCKADDR*)&clientAddr, &clientSize);
+        if (clientSocket == INVALID_SOCKET) {
+            std::cerr << "클라이언트 접속 실패: " << WSAGetLastError() << std::endl;
+            continue;
+        }
+
+        // 클라이언트 소켓을 클라이언트 리스트에 추가
+        clients.push_back(clientSocket);
+        std::cout << "클라이언트 연결됨!" << std::endl;
+
+        // 새로운 클라이언트 처리를 위한 스레드 생성
+        std::thread(clientHandler, clientSocket).detach();
+    }
+
+    // 서버 소켓 종료 및 Winsock 종료
+    closesocket(serverSocket);
+    WSACleanup();
+    return 0;
+}
+서버코드
+
+de <iostream>
+#include <string>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
+#pragma comment(lib, "ws2_32.lib")
+
+int main() {
+    WSADATA wsaData;
+    SOCKET sock;
+
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        std::cerr << "WSAStartup 실패: " << WSAGetLastError() << std::endl;
+        return 1;
+    }
+
+    sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock == INVALID_SOCKET) {
+        std::cerr << "소켓 생성 실패: " << WSAGetLastError() << std::endl;
+        WSACleanup();
+        return 1;
+    }
+
+    sockaddr_in serverAddr{};
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(12345);
+    if (inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr) <= 0) {
+        std::cerr << "IP 주소 변환 실패: " << WSAGetLastError() << std::endl;
+        closesocket(sock);
+        WSACleanup();
+        return 1;
+    }
+
+    if (connect(sock, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
+        std::cerr << "서버 연결 실패: " << WSAGetLastError() << std::endl;
+        closesocket(sock);
+        WSACleanup();
+        return 1;
+    }
+
+    std::cout << "서버에 연결되었습니다. 기존 채팅 기록:\n";
+
+    // 연결 직후 채팅 로그만 수신
+    char buffer[1024];
+    int bytesReceived;
+    // 2초 타임아웃 설정
+    timeval timeout{};
+    timeout.tv_sec = 2;
+    timeout.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+
+    while ((bytesReceived = recv(sock, buffer, sizeof(buffer) - 1, 0)) > 0) {
+        buffer[bytesReceived] = '\0';
+        std::cout << buffer;
+    }
+
+    // 이후엔 타임아웃 해제 (블로킹 모드)
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+
+    std::cout << "\n채팅을 시작하세요:\n";
+
+    std::string message;
+    while (true) {
+        std::cout << "[나] ";
+        std::getline(std::cin, message);
+        if (message.empty()) continue;
+        send(sock, message.c_str(), static_cast<int>(message.length()), 0);
+    }
+
+    closesocket(sock);
+    WSACleanup();
+    return 0;
+}
+클라이언트
+
+
